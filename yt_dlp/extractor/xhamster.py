@@ -16,6 +16,7 @@ from ..utils import (
     join_nonempty,
     parse_duration,
     str_or_none,
+    traverse_obj,
     try_call,
     try_get,
     unified_strdate,
@@ -182,55 +183,48 @@ class XHamsterIE(InfoExtractor):
                 return n - 0x100000000
             return n
 
-        def create_prng(algo_id: int, seed: int):
-            s = to_signed_32(seed)
+        class prng:
+            def __init__(self, algo_id: int, seed: int):
+                try:
+                    self._the_algo = getattr(self, f'_algo{algo_id}')
+                except AttributeError:
+                    raise ValueError(f'Unknown algorithm ID: {algo_id}')
+                self._s = to_signed_32(seed)
 
-            def algo1():
-                nonlocal s
-                s = to_signed_32(s * 1664525 + 1013904223)
-                return s & 0xFF
+            def _algo1(self, s):
+                s = self._s = to_signed_32(s * 1664525 + 1013904223)
+                return s
 
-            def algo2():
-                nonlocal s
+            def _algo2(self, s):
                 s = to_signed_32(s ^ (s << 13))
                 s = to_signed_32(s ^ ((s & 0xFFFFFFFF) >> 17))
-                s = to_signed_32(s ^ (s << 5))
-                return s & 0xFF
+                s = self._s = to_signed_32(s ^ (s << 5))
+                return s
 
-            def algo3():
-                nonlocal s
-                s = to_signed_32(s + 0x9e3779b9)
-                e = s
-                e = to_signed_32(e ^ ((e & 0xFFFFFFFF) >> 16))
-                e = to_signed_32(e * to_signed_32(0x85ebca77))
-                e = to_signed_32(e ^ ((e & 0xFFFFFFFF) >> 13))
-                e = to_signed_32(e * to_signed_32(0xc2b2ae3d))
-                e = to_signed_32(e ^ ((e & 0xFFFFFFFF) >> 16))
-                return e & 0xFF
+            def _algo3(self, s):
+                s = self._s = to_signed_32(s + 0x9e3779b9)
+                s = to_signed_32(s ^ ((s & 0xFFFFFFFF) >> 16))
+                s = to_signed_32(s * to_signed_32(0x85ebca77))
+                s = to_signed_32(s ^ ((s & 0xFFFFFFFF) >> 13))
+                s = to_signed_32(s * to_signed_32(0xc2b2ae3d))
+                return to_signed_32(s ^ ((s & 0xFFFFFFFF) >> 16))
 
-            if algo_id == 1:
-                return algo1
-            if algo_id == 2:
-                return algo2
-            if algo_id == 3:
-                return algo3
-            raise ValueError(f'Unknown algorithm ID: {algo_id}')
+            def next(self):
+                return self._the_algo(self._s) & 0xFF
 
         try:
             byte_data = bytes.fromhex(hex_string)
-        except ValueError as e:
+            byte_data[4]
+        except (ValueError, IndexError) as e:
             raise ValueError(f'Invalid hex string provided: {e}')
-
-        if len(byte_data) < 5:
-            raise ValueError('Hex string is too short.')
 
         algo_id = byte_data[0]
         seed = int.from_bytes(byte_data[1:5], byteorder='little', signed=True)
 
-        get_next_byte = create_prng(algo_id, seed)
+        byte_gen = prng(algo_id, seed)
 
         decrypted_bytes = bytearray(
-            byte_data[i] ^ get_next_byte() for i in range(5, len(byte_data))
+            byte_data[i] ^ byte_gen.next() for i in range(5, len(byte_data))
         )
 
         temp_string = decrypted_bytes.decode('latin-1')
@@ -303,55 +297,62 @@ class XHamsterIE(InfoExtractor):
             if xplayer_sources:
                 hls_sources = xplayer_sources.get('hls')
                 if isinstance(hls_sources, dict):
-                    if 'url' in hls_sources or 'fallback' in hls_sources:
-                        for hls_format_key in ('url', 'fallback'):
-                            hls_url = hls_sources.get(hls_format_key)
-                            if not hls_url:
-                                continue
-                            hls_url = self._decipher_format_url(hls_url, f'hls-{hls_format_key}')
-                            if not hls_url or hls_url in format_urls:
-                                continue
+                    hls_entries = (
+                        (key, str_or_none(url))
+                        for key, url in traverse_obj(
+                            hls_sources,
+                            ({dict.items}, lambda _, item: item[0] in ('url', 'fallback') and item[1]),
+                            default=[])
+                    )
+                    for hls_format_key, encrypted_url in hls_entries:
+                        if not encrypted_url:
+                            continue
+                        hls_url = self._decipher_format_url(encrypted_url, f'hls-{hls_format_key}')
+                        if hls_url and hls_url not in format_urls:
                             format_urls.add(hls_url)
                             formats.extend(self._extract_m3u8_formats(
                                 hls_url, video_id, 'mp4', entry_protocol='m3u8_native',
                                 m3u8_id='hls', fatal=False))
                 standard_sources = xplayer_sources.get('standard')
                 if isinstance(standard_sources, dict):
-                    for identifier, formats_list in standard_sources.items():
-                        if not isinstance(formats_list, list):
+                    standard_entries = (
+                        (identifier, format_dict, url_key, str_or_none(format_dict.get(url_key)))
+                        for identifier, format_list in traverse_obj(
+                            standard_sources,
+                            ({dict.items}, lambda _, item: isinstance(item[1], list) and item),
+                            default=[])
+                        for format_dict in traverse_obj(format_list, (..., {dict}), default=[])
+                        for url_key in ('url', 'fallback')
+                    )
+                    for identifier, format_dict, url_key, encrypted_url in standard_entries:
+                        if not encrypted_url:
                             continue
-                        for standard_format in formats_list:
-                            if not isinstance(standard_format, dict):
-                                continue
-                            for standard_format_key in ('url', 'fallback'):
-                                standard_url = standard_format.get(standard_format_key)
-                                if not standard_url:
-                                    continue
-                                quality = (str_or_none(standard_format.get('quality'))
-                                           or str_or_none(standard_format.get('label'))
-                                           or '')
-                                format_id = join_nonempty(identifier, quality)
-                                standard_url = self._decipher_format_url(standard_url, format_id)
-                                if not standard_url or standard_url in format_urls:
-                                    continue
-                                format_urls.add(standard_url)
-                                ext = determine_ext(standard_url, 'mp4')
-                                if ext == 'm3u8':
-                                    formats.extend(self._extract_m3u8_formats(
-                                        standard_url, video_id, 'mp4', entry_protocol='m3u8_native',
-                                        m3u8_id='hls', fatal=False))
-                                    continue
-
-                                formats.append({
-                                    'format_id': format_id,
-                                    'url': standard_url,
-                                    'ext': ext,
-                                    'height': get_height(quality),
-                                    'filesize': format_sizes.get(quality),
-                                    'http_headers': {
-                                        'Referer': standard_url,
-                                    },
-                                })
+                        quality = (str_or_none(format_dict.get('quality'))
+                                   or str_or_none(format_dict.get('label'))
+                                   or '')
+                        format_id = join_nonempty(identifier, quality)
+                        if url_key == 'fallback':
+                            format_id = join_nonempty(format_id, url_key)
+                        standard_url = self._decipher_format_url(encrypted_url, format_id)
+                        if not standard_url or standard_url in format_urls:
+                            continue
+                        format_urls.add(standard_url)
+                        ext = determine_ext(standard_url, 'mp4')
+                        if ext == 'm3u8':
+                            formats.extend(self._extract_m3u8_formats(
+                                standard_url, video_id, 'mp4', entry_protocol='m3u8_native',
+                                m3u8_id='hls', fatal=False))
+                        else:
+                            formats.append({
+                                'format_id': format_id,
+                                'url': standard_url,
+                                'ext': ext,
+                                'height': get_height(quality),
+                                'filesize': format_sizes.get(quality),
+                                'http_headers': {
+                                    'Referer': standard_url,
+                                },
+                            })
 
             categories_list = video.get('categories')
             if isinstance(categories_list, list):
